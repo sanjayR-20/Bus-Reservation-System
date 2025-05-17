@@ -1,0 +1,791 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Bus Reservation System</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-gray-100 min-h-screen">
+    <div id="root"></div>
+    <script type="text/babel">
+/**
+ * Bus Reservation System SPA (Sync Fixes)
+ * - Cancelling a booking frees seats and removes user from SmartSeat/Modify
+ * - Only users with active bookings can modify/cancel
+ * - SmartSeat only shows users who have not booked
+ * - All logic in this file, no imports/exports, uses Arrays and Linked Lists only
+ */
+
+// -------------------- Data Structures & Constants --------------------
+
+const MAX_USERS = 100;
+const BUS_LIST = [
+  { id: 1, name: "Ooty", interests: ["Gardens", "Hills", "Boating"], seats: 20 },
+  { id: 2, name: "Chennai", interests: ["Beaches", "Temples", "Shopping"], seats: 30 },
+  { id: 3, name: "Mysore", interests: ["Monuments", "Museums", "Palaces"], seats: 25 },
+  { id: 4, name: "Kochi", interests: ["Backwaters", "Seafood", "Fort"], seats: 18 },
+  { id: 5, name: "Madurai", interests: ["Temples", "Markets", "Cuisine"], seats: 22 },
+];
+
+const PRICING = {
+  Ooty:    { Peak: 20, Normal: 15, Loyalty: 12 },
+  Chennai: { Peak: 18, Normal: 13, Loyalty: 10 },
+  Mysore:  { Peak: 22, Normal: 16, Loyalty: 13 },
+  Kochi:   { Peak: 25, Normal: 18, Loyalty: 15 },
+  Madurai: { Peak: 19, Normal: 14, Loyalty: 11 },
+};
+
+function getTimeSlot() {
+  const hour = new Date().getHours();
+  if (hour >= 7 && hour < 10) return "Peak";
+  if (hour >= 10 && hour < 16) return "Normal";
+  return "Loyalty";
+}
+
+function generateSeats(bus) {
+  const seats = [];
+  for (let i = 1; i <= bus.seats; i++) {
+    seats.push({
+      number: i,
+      type: i % 2 === 1 ? "window" : "aisle",
+      available: true,
+      userId: null,
+    });
+  }
+  return seats;
+}
+
+// Linked List for user preferences (for dynamic updates)
+function createPreferenceList(users) {
+  let head = null, prev = null;
+  users.forEach(user => {
+    const node = { user, next: null };
+    if (!head) head = node;
+    if (prev) prev.next = node;
+    prev = node;
+  });
+  return head;
+}
+
+// Linked List for seat ranking (by preference)
+function createSeatList(seats, prefType) {
+  let head = null, prev = null;
+  seats
+    .filter(seat => seat.available)
+    .sort((a, b) => (a.type === prefType ? -1 : 1))
+    .forEach(seat => {
+      const node = { seat, next: null };
+      if (!head) head = node;
+      if (prev) prev.next = node;
+      prev = node;
+    });
+  return head;
+}
+
+// Booking history Linked List (queue)
+function createBookingHistoryList() {
+  return { head: null, tail: null, length: 0 };
+}
+function addBooking(history, booking) {
+  const node = { booking, next: null, prev: null };
+  if (!history.head) {
+    history.head = history.tail = node;
+  } else {
+    history.tail.next = node;
+    node.prev = history.tail;
+    history.tail = node;
+  }
+  history.length++;
+}
+function removeBooking(history, bookingId) {
+  let curr = history.head;
+  while (curr) {
+    if (curr.booking.id === bookingId) {
+      if (curr.prev) curr.prev.next = curr.next;
+      if (curr.next) curr.next.prev = curr.prev;
+      if (curr === history.head) history.head = curr.next;
+      if (curr === history.tail) history.tail = curr.prev;
+      history.length--;
+      return true;
+    }
+    curr = curr.next;
+  }
+  return false;
+}
+
+// Undo/Redo Linked Lists (stack)
+function createUndoRedoList() {
+  return { head: null, length: 0 };
+}
+function pushState(list, state) {
+  const node = { state: JSON.parse(JSON.stringify(state)), next: list.head };
+  list.head = node;
+  list.length++;
+}
+function popState(list) {
+  if (!list.head) return null;
+  const state = list.head.state;
+  list.head = list.head.next;
+  list.length--;
+  return state;
+}
+
+// Social Matching Linked List (compatibility)
+function createCompatibilityList(users, currentUser) {
+  let head = null, prev = null;
+  users.forEach(user => {
+    if (
+      user.id !== currentUser.id &&
+      user.destination === currentUser.destination &&
+      user.interests.some(i => currentUser.interests.includes(i))
+    ) {
+      const node = { user, next: null };
+      if (!head) head = node;
+      if (prev) prev.next = node;
+      prev = node;
+    }
+  });
+  return head;
+}
+
+// -------------------- React Components --------------------
+
+function NavBar({ section, setSection }) {
+  return (
+    <nav className="bg-blue-700 text-white px-4 py-2 flex flex-wrap gap-2 rounded-b-lg shadow">
+      {["Register", "Book", "SmartSeat", "Matches", "Pricing", "History", "Modify", "Cancel", "Undo/Redo"].map(s => (
+        <button
+          key={s}
+          className={`px-3 py-1 rounded hover:bg-blue-900 transition ${section === s ? "bg-blue-900" : ""}`}
+          onClick={() => setSection(s)}
+        >
+          {s}
+        </button>
+      ))}
+    </nav>
+  );
+}
+
+// User Management (Registration)
+function UserManagement({ users, setUsers, preferenceList, setPreferenceList }) {
+  const [destination, setDestination] = React.useState(BUS_LIST[0].name);
+  const [name, setName] = React.useState("");
+  const [seat, setSeat] = React.useState("window");
+  const [interest, setInterest] = React.useState(BUS_LIST[0].interests[0]);
+  const [numSeats, setNumSeats] = React.useState(1);
+  const [error, setError] = React.useState("");
+  const [userId, setUserId] = React.useState(null);
+
+  React.useEffect(() => {
+    setInterest(BUS_LIST.find(b => b.name === destination).interests[0]);
+  }, [destination]);
+
+  function generateUserId() {
+    let id;
+    do {
+      id = Math.floor(1000 + Math.random() * 9000);
+    } while (users.some(u => u.userId === id));
+    return id;
+  }
+
+  function handleRegister() {
+    if (!name.trim()) {
+      setError("Name is required.");
+      return;
+    }
+    if (users.length >= MAX_USERS) {
+      setError("User limit reached.");
+      return;
+    }
+    if (!destination) {
+      setError("Destination required.");
+      return;
+    }
+    if (!interest) {
+      setError("Select an interest.");
+      return;
+    }
+    const newId = generateUserId();
+    setUserId(newId);
+    const newUser = {
+      id: Date.now(),
+      userId: newId,
+      name: name.trim(),
+      preferences: { seat },
+      interests: [interest],
+      destination,
+      numSeats: Number(numSeats),
+    };
+    const newUsers = [...users, newUser];
+    setUsers(newUsers);
+    setPreferenceList(createPreferenceList(newUsers));
+    setName("");
+    setSeat("window");
+    setInterest(BUS_LIST.find(b => b.name === destination).interests[0]);
+    setNumSeats(1);
+    setError("");
+    // Placeholder: API call to C backend to register user
+  }
+
+  return (
+    <div className="max-w-lg mx-auto mt-6 bg-white p-6 rounded shadow">
+      <h2 className="text-xl font-bold mb-4">Register User</h2>
+      <div className="mb-2">
+        <label className="block font-semibold">Destination</label>
+        <select className="border rounded px-2 py-1 w-full" value={destination} onChange={e => setDestination(e.target.value)}>
+          {BUS_LIST.map(b => <option key={b.id} value={b.name}>{b.name}</option>)}
+        </select>
+      </div>
+      <div className="mb-2">
+        <label className="block font-semibold">Name</label>
+        <input className="border rounded px-2 py-1 w-full" value={name} onChange={e => setName(e.target.value)} />
+      </div>
+      <div className="mb-2">
+        <label className="block font-semibold">Seat Preference</label>
+        <select className="border rounded px-2 py-1 w-full" value={seat} onChange={e => setSeat(e.target.value)}>
+          <option value="window">Window</option>
+          <option value="aisle">Aisle</option>
+        </select>
+      </div>
+      <div className="mb-2">
+        <label className="block font-semibold">Interest</label>
+        <select className="border rounded px-2 py-1 w-full" value={interest} onChange={e => setInterest(e.target.value)}>
+          {BUS_LIST.find(b => b.name === destination).interests.map(i => (
+            <option key={i} value={i}>{i}</option>
+          ))}
+        </select>
+      </div>
+      <div className="mb-2">
+        <label className="block font-semibold">Number of Seats</label>
+        <input type="number" min="1" max="10" className="border rounded px-2 py-1 w-full" value={numSeats} onChange={e => setNumSeats(e.target.value)} />
+      </div>
+      {userId && <div className="text-green-700 mb-2">Your User ID: <b>{userId}</b></div>}
+      {error && <div className="text-red-600 mb-2">{error}</div>}
+      <button className="bg-blue-700 text-white px-4 py-2 rounded hover:bg-blue-900" onClick={handleRegister}>Register</button>
+      <div className="mt-6">
+        <h3 className="font-bold mb-2">Registered Users</h3>
+        <ul className="list-disc pl-5">
+          {users.map(u => (
+            <li key={u.id}>
+              <span className="font-mono text-blue-700">{u.userId}</span> - {u.name} ({u.preferences.seat}) - {u.destination} - {u.interests.join(", ")} - Seats: {u.numSeats}
+            </li>
+          ))}
+        </ul>
+      </div>
+    </div>
+  );
+}
+
+// SmartSeat Allocation
+function SmartSeatAllocation({ users, buses, setBuses, bookings }) {
+  // Only users who have not booked (no booking with action "book" and not "cancel")
+  const bookedUserIds = [];
+  let curr = bookings.head;
+  while (curr) {
+    if (curr.booking.action === "book") bookedUserIds.push(curr.booking.userId);
+    if (curr.booking.action === "cancel") {
+      // Remove canceled user from bookedUserIds
+      const idx = bookedUserIds.indexOf(curr.booking.userId);
+      if (idx !== -1) bookedUserIds.splice(idx, 1);
+    }
+    curr = curr.next;
+  }
+  const availableUsers = users.filter(u => !bookedUserIds.includes(u.userId));
+  const [selectedUserId, setSelectedUserId] = React.useState(availableUsers[0]?.userId || "");
+  const [recommendations, setRecommendations] = React.useState([]);
+  const [selectedBus, setSelectedBus] = React.useState(BUS_LIST[0].name);
+
+  React.useEffect(() => {
+    const user = users.find(u => u.userId === Number(selectedUserId));
+    if (user) setSelectedBus(user.destination);
+  }, [selectedUserId, users]);
+
+  function handleRecommend() {
+    const user = users.find(u => u.userId === Number(selectedUserId));
+    if (!user) return;
+    const bus = buses.find(b => b.name === user.destination);
+    if (!bus) return;
+    // Linked List ranking by preference
+    const seatList = createSeatList(bus.seats, user.preferences.seat);
+    // Linear search for top N seats (N = user.numSeats)
+    let recs = [];
+    let curr = seatList, count = 0;
+    while (curr && count < user.numSeats) {
+      recs.push(curr.seat);
+      curr = curr.next;
+      count++;
+    }
+    setRecommendations(recs);
+  }
+
+  function handleBook(seatNums) {
+    const user = users.find(u => u.userId === Number(selectedUserId));
+    if (!user) return;
+    setBuses(buses.map(bus => {
+      if (bus.name !== user.destination) return bus;
+      return {
+        ...bus,
+        seats: bus.seats.map(s =>
+          seatNums.includes(s.number) ? { ...s, available: false, userId: user.userId } : s
+        ),
+      };
+    }));
+    setRecommendations([]);
+    // Placeholder: API call to C backend to book seat
+  }
+
+  return (
+    <div className="max-w-2xl mx-auto mt-6 bg-white p-6 rounded shadow">
+      <h2 className="text-xl font-bold mb-4">SmartSeat Allocation</h2>
+      <div className="mb-2">
+        <label className="block font-semibold">Select User</label>
+        <select className="border rounded px-2 py-1 w-full" value={selectedUserId} onChange={e => setSelectedUserId(Number(e.target.value))}>
+          {availableUsers.map(u => <option key={u.userId} value={u.userId}>{u.name} ({u.userId}) - {u.destination}</option>)}
+        </select>
+      </div>
+      {selectedUserId && (
+        <>
+          <button className="bg-blue-700 text-white px-4 py-2 rounded hover:bg-blue-900 mb-4" onClick={handleRecommend}>Recommend Seats</button>
+          <div className="mb-4">
+            {BUS_LIST.map(bus => (
+              <div key={bus.id} className="mb-2">
+                <div className="font-semibold">{bus.name}</div>
+                <div className="grid grid-cols-10 gap-1">
+                  {buses.find(b => b.name === bus.name).seats.map(seat => (
+                    <div key={seat.number}
+                      className={`p-1 rounded border text-center text-xs ${seat.available ? "bg-green-100" : "bg-gray-300 text-gray-400"} ${seat.userId ? "font-bold" : ""}`}>
+                      {seat.type === "window" ? "🪟" : "🪑"}
+                      <br />
+                      {seat.userId ? <span className="text-blue-700">{seat.userId}</span> : `#${seat.number}`}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+          {recommendations.length > 0 && (
+            <div>
+              <h3 className="font-bold mb-2">Recommended Seats</h3>
+              <div className="flex gap-2 flex-wrap">
+                <button
+                  className="bg-green-500 text-white px-3 py-1 rounded hover:bg-green-700"
+                  onClick={() => handleBook(recommendations.map(s => s.number))}
+                >
+                  Book {recommendations.map(s => `#${s.number}`).join(", ")}
+                </button>
+              </div>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// Social Matching
+function SocialMatching({ users }) {
+  const [selectedUserId, setSelectedUserId] = React.useState(users[0]?.userId || "");
+  const [matches, setMatches] = React.useState([]);
+
+  function handleFindMatches() {
+    const user = users.find(u => u.userId === Number(selectedUserId));
+    if (!user) return;
+    const compatList = createCompatibilityList(users, user);
+    let curr = compatList, found = [];
+    while (curr) {
+      found.push(curr.user);
+      curr = curr.next;
+    }
+    setMatches(found);
+  }
+
+  return (
+    <div className="max-w-lg mx-auto mt-6 bg-white p-6 rounded shadow">
+      <h2 className="text-xl font-bold mb-4">Social Matching</h2>
+      <div className="mb-2">
+        <label className="block font-semibold">Select Passenger</label>
+        <select className="border rounded px-2 py-1 w-full" value={selectedUserId} onChange={e => setSelectedUserId(Number(e.target.value))}>
+          {users.map(u => <option key={u.userId} value={u.userId}>{u.name} ({u.userId}) - {u.destination}</option>)}
+        </select>
+      </div>
+      <button className="bg-blue-700 text-white px-4 py-2 rounded hover:bg-blue-900 mb-4" onClick={handleFindMatches}>Find Compatible Seatmates</button>
+      {matches.length > 0 && (
+        <div>
+          <h3 className="font-bold mb-2">Compatible Passengers</h3>
+          <ul className="list-disc pl-5">
+            {matches.map(u => (
+              <li key={u.userId}>{u.name} ({u.userId}) - {u.interests.join(", ")} - {u.destination}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Dynamic Pricing
+function DynamicPricing({ buses }) {
+  const slot = getTimeSlot();
+  return (
+    <div className="max-w-2xl mx-auto mt-6 bg-white p-6 rounded shadow">
+      <h2 className="text-xl font-bold mb-4">Dynamic Pricing</h2>
+      <table className="w-full table-auto border">
+        <thead>
+          <tr>
+            <th className="border px-2 py-1">Destination</th>
+            <th className="border px-2 py-1">Peak (7-9am)</th>
+            <th className="border px-2 py-1">Normal (10am-3pm)</th>
+            <th className="border px-2 py-1">Loyalty (Evening/Night)</th>
+            <th className="border px-2 py-1">Current</th>
+          </tr>
+        </thead>
+        <tbody>
+          {BUS_LIST.map(bus => (
+            <tr key={bus.id}>
+              <td className="border px-2 py-1">{bus.name}</td>
+              <td className="border px-2 py-1">${PRICING[bus.name].Peak}</td>
+              <td className="border px-2 py-1">${PRICING[bus.name].Normal}</td>
+              <td className="border px-2 py-1">${PRICING[bus.name].Loyalty}</td>
+              <td className="border px-2 py-1 font-bold">${PRICING[bus.name][slot]}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="mt-2 text-sm text-gray-600">Current time slot: <b>{slot}</b></div>
+    </div>
+  );
+}
+
+// Booking Management
+function BookingManagement({ users, buses, bookings, setBookings, undoList, redoList }) {
+  // Only users who have not booked
+  const bookedUserIds = [];
+  let curr = bookings.head;
+  while (curr) {
+    if (curr.booking.action === "book") bookedUserIds.push(curr.booking.userId);
+    if (curr.booking.action === "cancel") {
+      const idx = bookedUserIds.indexOf(curr.booking.userId);
+      if (idx !== -1) bookedUserIds.splice(idx, 1);
+    }
+    curr = curr.next;
+  }
+  const availableUsers = users.filter(u => !bookedUserIds.includes(u.userId));
+  const [userId, setUserId] = React.useState(availableUsers[0]?.userId || "");
+  const [error, setError] = React.useState("");
+  const [success, setSuccess] = React.useState("");
+
+  function handleBook() {
+    const user = users.find(u => u.userId === Number(userId));
+    if (!user) {
+      setError("Select user.");
+      return;
+    }
+    const bus = buses.find(b => b.name === user.destination);
+    if (!bus) {
+      setError("Bus not found.");
+      return;
+    }
+    // Find available seats
+    const availableSeats = bus.seats.filter(s => s.available).slice(0, user.numSeats);
+    if (availableSeats.length < user.numSeats) {
+      setError("Not enough seats available.");
+      return;
+    }
+    // Book seats
+    availableSeats.forEach(seat => {
+      seat.available = false;
+      seat.userId = user.userId;
+    });
+    // Add booking to history
+    const booking = {
+      id: Date.now(),
+      userId: user.userId,
+      name: user.name,
+      destination: user.destination,
+      seats: availableSeats.map(s => s.number),
+      price: PRICING[user.destination][getTimeSlot()] * user.numSeats,
+      action: "book",
+      time: new Date().toLocaleString(),
+    };
+    addBooking(bookings, booking);
+    pushState(undoList, { bookings: JSON.parse(JSON.stringify(bookings)) });
+    redoList.head = null;
+    setError("");
+    setSuccess(`Booked seats ${booking.seats.join(", ")} for user ${user.name} (${user.userId})`);
+    // Placeholder: API call to C backend for booking
+  }
+
+  return (
+    <div className="max-w-lg mx-auto mt-6 bg-white p-6 rounded shadow">
+      <h2 className="text-xl font-bold mb-4">Booking Management</h2>
+      <div className="mb-2">
+        <label className="block font-semibold">User</label>
+        <select className="border rounded px-2 py-1 w-full" value={userId} onChange={e => setUserId(Number(e.target.value))}>
+          {availableUsers.map(u => <option key={u.userId} value={u.userId}>{u.name} ({u.userId}) - {u.destination}</option>)}
+        </select>
+      </div>
+      {error && <div className="text-red-600 mb-2">{error}</div>}
+      {success && <div className="text-green-700 mb-2">{success}</div>}
+      <button className="bg-green-700 text-white px-4 py-2 rounded hover:bg-green-900" onClick={handleBook}>Book</button>
+    </div>
+  );
+}
+
+// Booking History (shows only bookings and cancellations)
+function BookingHistory({ bookings }) {
+  return (
+    <div className="max-w-2xl mx-auto mt-6 bg-white p-6 rounded shadow">
+      <h2 className="text-xl font-bold mb-4">Booking & Cancellation History</h2>
+      <ul className="list-disc pl-5">
+        {(() => {
+          let curr = bookings.head, items = [];
+          while (curr) {
+            items.push(
+              <li key={curr.booking.id}>
+                [{curr.booking.action.toUpperCase()}] {curr.booking.name} ({curr.booking.userId}) - {curr.booking.destination} - Seats: {curr.booking.seats?.join(", ")} - ${curr.booking.price} <span className="text-xs text-gray-500">({curr.booking.time})</span>
+              </li>
+            );
+            curr = curr.next;
+          }
+          return items.length ? items : <li>No bookings or cancellations yet.</li>;
+        })()}
+      </ul>
+    </div>
+  );
+}
+
+// Modification Page
+function ModificationPage({ users, bookings, setUsers }) {
+  // Only users with an active booking (not canceled)
+  const bookedUserIds = [];
+  let curr = bookings.head;
+  while (curr) {
+    if (curr.booking.action === "book") bookedUserIds.push(curr.booking.userId);
+    if (curr.booking.action === "cancel") {
+      const idx = bookedUserIds.indexOf(curr.booking.userId);
+      if (idx !== -1) bookedUserIds.splice(idx, 1);
+    }
+    curr = curr.next;
+  }
+  const modifiableUsers = users.filter(u => bookedUserIds.includes(u.userId));
+  const [userId, setUserId] = React.useState(modifiableUsers[0]?.userId || "");
+  const [numSeats, setNumSeats] = React.useState(1);
+  const [destination, setDestination] = React.useState(BUS_LIST[0].name);
+  const [success, setSuccess] = React.useState("");
+
+  React.useEffect(() => {
+    const user = modifiableUsers.find(u => u.userId === Number(userId));
+    if (user) {
+      setNumSeats(user.numSeats);
+      setDestination(user.destination);
+    }
+  }, [userId, modifiableUsers]);
+
+  function handleModify() {
+    setUsers(users.map(u =>
+      u.userId === Number(userId)
+        ? { ...u, numSeats: Number(numSeats), destination }
+        : u
+    ));
+    setSuccess("Modification successful!");
+    // Placeholder: API call to C backend for modification
+  }
+
+  return (
+    <div className="max-w-lg mx-auto mt-6 bg-white p-6 rounded shadow">
+      <h2 className="text-xl font-bold mb-4">Modify Booking</h2>
+      <div className="mb-2">
+        <label className="block font-semibold">User</label>
+        <select className="border rounded px-2 py-1 w-full" value={userId} onChange={e => setUserId(Number(e.target.value))}>
+          {modifiableUsers.map(u => <option key={u.userId} value={u.userId}>{u.name} ({u.userId})</option>)}
+        </select>
+      </div>
+      <div className="mb-2">
+        <label className="block font-semibold">Destination</label>
+        <select className="border rounded px-2 py-1 w-full" value={destination} onChange={e => setDestination(e.target.value)}>
+          {BUS_LIST.map(b => <option key={b.id} value={b.name}>{b.name}</option>)}
+        </select>
+      </div>
+      <div className="mb-2">
+        <label className="block font-semibold">Number of Seats</label>
+        <input type="number" min="1" max="10" className="border rounded px-2 py-1 w-full" value={numSeats} onChange={e => setNumSeats(e.target.value)} />
+      </div>
+      {success && <div className="text-green-700 mb-2">{success}</div>}
+      <button className="bg-yellow-700 text-white px-4 py-2 rounded hover:bg-yellow-900" onClick={handleModify}>Modify</button>
+    </div>
+  );
+}
+
+// Cancellation Page
+function CancellationPage({ users, bookings, setBookings, buses, setBuses }) {
+  // Only users with an active booking (not canceled)
+  const bookedUserIds = [];
+  let curr = bookings.head;
+  while (curr) {
+    if (curr.booking.action === "book") bookedUserIds.push(curr.booking.userId);
+    if (curr.booking.action === "cancel") {
+      const idx = bookedUserIds.indexOf(curr.booking.userId);
+      if (idx !== -1) bookedUserIds.splice(idx, 1);
+    }
+    curr = curr.next;
+  }
+  const cancelableUsers = users.filter(u => bookedUserIds.includes(u.userId));
+  const [userId, setUserId] = React.useState(cancelableUsers[0]?.userId || "");
+  const [success, setSuccess] = React.useState("");
+  const [error, setError] = React.useState("");
+
+  function handleCancel() {
+    let curr = bookings.head;
+    let found = false;
+    let bookingToCancel = null;
+    while (curr) {
+      if (curr.booking.userId === Number(userId) && curr.booking.action === "book") {
+        curr.booking.action = "cancel";
+        curr.booking.time = new Date().toLocaleString();
+        bookingToCancel = curr.booking;
+        found = true;
+        break;
+      }
+      curr = curr.next;
+    }
+    if (found && bookingToCancel) {
+      // Free up seats in the bus
+      setBuses(buses.map(bus => {
+        if (bus.name !== bookingToCancel.destination) return bus;
+        return {
+          ...bus,
+          seats: bus.seats.map(seat =>
+            bookingToCancel.seats.includes(seat.number)
+              ? { ...seat, available: true, userId: null }
+              : seat
+          ),
+        };
+      }));
+      setSuccess("Booking cancelled.");
+      setError("");
+      // Placeholder: API call to C backend for cancellation
+    } else {
+      setError("No booking found for this user.");
+      setSuccess("");
+    }
+  }
+
+  const user = cancelableUsers.find(u => u.userId === Number(userId));
+
+  return (
+    <div className="max-w-lg mx-auto mt-6 bg-white p-6 rounded shadow">
+      <h2 className="text-xl font-bold mb-4">Cancel Booking</h2>
+      <div className="mb-2">
+        <label className="block font-semibold">User</label>
+        <select className="border rounded px-2 py-1 w-full" value={userId} onChange={e => setUserId(Number(e.target.value))}>
+          {cancelableUsers.map(u => <option key={u.userId} value={u.userId}>{u.name} ({u.userId})</option>)}
+        </select>
+      </div>
+      {user && (
+        <div className="mb-2">
+          <div><b>Name:</b> {user.name}</div>
+          <div><b>Destination:</b> {user.destination}</div>
+          <div><b>Seats:</b> {user.numSeats}</div>
+        </div>
+      )}
+      {success && <div className="text-green-700 mb-2">{success}</div>}
+      {error && <div className="text-red-600 mb-2">{error}</div>}
+      <button className="bg-red-700 text-white px-4 py-2 rounded hover:bg-red-900" onClick={handleCancel}>Cancel Booking</button>
+    </div>
+  );
+}
+
+// Undo/Redo System
+function UndoRedoSystem({ bookings, setBookings, undoList, redoList }) {
+  function handleUndo() {
+    const prev = popState(undoList);
+    if (prev) {
+      pushState(redoList, { bookings: JSON.parse(JSON.stringify(bookings)) });
+      setBookings(prev.bookings);
+    }
+  }
+  function handleRedo() {
+    const next = popState(redoList);
+    if (next) {
+      pushState(undoList, { bookings: JSON.parse(JSON.stringify(bookings)) });
+      setBookings(next.bookings);
+    }
+  }
+  return (
+    <div className="max-w-lg mx-auto mt-6 bg-white p-6 rounded shadow flex flex-col items-center">
+      <h2 className="text-xl font-bold mb-4">Undo/Redo System</h2>
+      <div className="flex gap-4">
+        <button className="bg-yellow-500 text-white px-4 py-2 rounded hover:bg-yellow-700" onClick={handleUndo}>Undo</button>
+        <button className="bg-green-500 text-white px-4 py-2 rounded hover:bg-green-700" onClick={handleRedo}>Redo</button>
+      </div>
+      <div className="mt-4 text-gray-600 text-sm">
+        Undo/Redo booking actions instantly (O(1) state change).
+      </div>
+    </div>
+  );
+}
+
+// -------------------- Main App --------------------
+
+function App() {
+  // State for users, buses, bookings, undo/redo
+  const [users, setUsers] = React.useState([]);
+  const [preferenceList, setPreferenceList] = React.useState(createPreferenceList([]));
+  const [buses, setBuses] = React.useState(BUS_LIST.map(bus => ({
+    ...bus,
+    seats: generateSeats(bus),
+  })));
+  const [bookings, setBookings] = React.useState(createBookingHistoryList());
+  const [undoList] = React.useState(createUndoRedoList());
+  const [redoList] = React.useState(createUndoRedoList());
+  const [section, setSection] = React.useState("Register");
+
+  return (
+    <div>
+      <NavBar section={section} setSection={setSection} />
+      <div className="max-w-4xl mx-auto">
+        {section === "Register" && (
+          <UserManagement users={users} setUsers={setUsers} preferenceList={preferenceList} setPreferenceList={setPreferenceList} />
+        )}
+        {section === "SmartSeat" && (
+          <SmartSeatAllocation users={users} buses={buses} setBuses={setBuses} bookings={bookings} />
+        )}
+        {section === "Matches" && (
+          <SocialMatching users={users} />
+        )}
+        {section === "Pricing" && (
+          <DynamicPricing buses={buses} />
+        )}
+        {section === "Book" && (
+          <BookingManagement users={users} buses={buses} bookings={bookings} setBookings={setBookings} undoList={undoList} redoList={redoList} />
+        )}
+        {section === "History" && (
+          <BookingHistory bookings={bookings} />
+        )}
+        {section === "Modify" && (
+          <ModificationPage users={users} bookings={bookings} setUsers={setUsers} />
+        )}
+        {section === "Cancel" && (
+          <CancellationPage users={users} bookings={bookings} setBookings={setBookings} buses={buses} setBuses={setBuses} />
+        )}
+        {section === "Undo/Redo" && (
+          <UndoRedoSystem bookings={bookings} setBookings={setBookings} undoList={undoList} redoList={redoList} />
+        )}
+      </div>
+      <footer className="text-center text-gray-500 text-xs mt-10 mb-2">
+        &copy; {new Date().getFullYear()} Bus Reservation System | Academic Demo | Tailwind + React + Linked Lists/Arrays
+      </footer>
+    </div>
+  );
+}
+
+// Render App
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App />);
+    </script>
+</body>
+</html>
